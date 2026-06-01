@@ -9,7 +9,7 @@ let scene, camera, renderer, controls, gridHelper, currentModel;
 const textureFiles = new Map();   // name → File
 const loadedTextures = new Map(); // name → THREE.Texture
 const textureEnabled = new Map(); // name → boolean
-const originalMaterials = new Map(); // mesh uuid → { slot, origMap }
+const originalMaterials = new Map(); // key → { mesh, matIndex, mapType, textureName, texture }
 
 let objFile = null;
 let mtlFile = null;
@@ -42,7 +42,6 @@ function initScene() {
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
 
-  // Lighting
   const ambient = new THREE.AmbientLight(0xffffff, 0.6);
   scene.add(ambient);
 
@@ -115,7 +114,6 @@ btnLoad.addEventListener("click", async () => {
   try {
     clearModel();
 
-    // Pre-load texture images into THREE.Texture
     await loadAllTextures();
 
     let materials = null;
@@ -136,10 +134,7 @@ btnLoad.addEventListener("click", async () => {
     model.scale.setScalar(scale);
     model.position.sub(center.multiplyScalar(scale));
 
-    // Collect original material texture references
     cacheOriginalMaterials(model);
-
-    // Build texture panel with toggles
     buildTexturePanel();
 
     setStatus(`Model loaded — ${countMeshes(model)} mesh(es)`);
@@ -151,6 +146,19 @@ btnLoad.addEventListener("click", async () => {
   btnLoad.disabled = false;
 });
 
+// ── Texture name matching ──────────────────────────────────────────
+function findTextureMatch(refName) {
+  if (!refName) return null;
+  if (loadedTextures.has(refName)) return refName;
+  const base = refName.split(/[\\/]/).pop();
+  if (loadedTextures.has(base)) return base;
+  const lower = base.toLowerCase();
+  for (const name of loadedTextures.keys()) {
+    if (name.toLowerCase() === lower) return name;
+  }
+  return null;
+}
+
 // ── Parse MTL (from File) ──────────────────────────────────────────
 function parseMTL(file) {
   return new Promise((resolve, reject) => {
@@ -158,25 +166,29 @@ function parseMTL(file) {
     reader.onload = () => {
       try {
         const loader = new MTLLoader();
-
-        // Custom texture resolver: looks up our loaded textures
         const text = reader.result;
         const matCreator = loader.parse(text, "");
 
-        // Override texture loading to use our pre-loaded textures
-        const origCreate = matCreator.create.bind(matCreator);
-        matCreator.create = function (name) {
-          // Let MTLLoader create the material first
+        // Override the internal loadTexture so MTLLoader uses our
+        // pre-loaded in-memory textures instead of fetching URLs
+        matCreator.loadTexture = function (url, mapping, onLoad) {
+          const match = findTextureMatch(url);
+          if (match && loadedTextures.has(match)) {
+            const tex = loadedTextures.get(match).clone();
+            tex.name = match;
+            if (mapping !== undefined) tex.mapping = mapping;
+            tex.needsUpdate = true;
+            if (onLoad) onLoad(tex);
+            return tex;
+          }
+          // Return blank texture for unresolved references
+          const blank = new THREE.Texture();
+          blank.name = url;
+          if (onLoad) onLoad(blank);
+          return blank;
         };
 
-        // Instead, manually handle: parse materials then swap textures
         matCreator.preload();
-
-        // For each material, replace textures with our loaded ones
-        for (const [name, mat] of Object.entries(matCreator.materials)) {
-          patchMaterialTextures(mat);
-        }
-
         resolve(matCreator);
       } catch (e) {
         reject(e);
@@ -185,43 +197,6 @@ function parseMTL(file) {
     reader.onerror = reject;
     reader.readAsText(file);
   });
-}
-
-function patchMaterialTextures(material) {
-  const mapTypes = ["map", "normalMap", "specularMap", "emissiveMap", "bumpMap", "alphaMap"];
-  for (const mt of mapTypes) {
-    if (material[mt] && material[mt].image === undefined) {
-      // The MTL referenced a texture file — try to match it
-      const texName = findTextureMatch(material[mt].name || material[mt].sourceFile || "");
-      if (texName && loadedTextures.has(texName)) {
-        material[mt] = loadedTextures.get(texName).clone();
-        material[mt].needsUpdate = true;
-      }
-    }
-  }
-  // Also check if there's a map_Kd reference stored on the material
-  if (material.userData && material.userData.mapKd) {
-    const texName = findTextureMatch(material.userData.mapKd);
-    if (texName && loadedTextures.has(texName)) {
-      material.map = loadedTextures.get(texName).clone();
-      material.map.needsUpdate = true;
-    }
-  }
-}
-
-function findTextureMatch(refName) {
-  if (!refName) return null;
-  // Exact match first
-  if (textureFiles.has(refName)) return refName;
-  // Basename match
-  const base = refName.split(/[\\/]/).pop();
-  if (textureFiles.has(base)) return base;
-  // Case-insensitive
-  const lower = base.toLowerCase();
-  for (const name of textureFiles.keys()) {
-    if (name.toLowerCase() === lower) return name;
-  }
-  return null;
 }
 
 // ── Parse OBJ (from File) ──────────────────────────────────────────
@@ -236,20 +211,10 @@ function parseOBJ(file, materials) {
         }
         const obj = loader.parse(reader.result);
 
-        // If no MTL, apply loaded textures to meshes automatically
+        // If no MTL provided but textures are loaded, auto-apply
         if (!materials && loadedTextures.size > 0) {
           autoApplyTextures(obj);
         }
-
-        // Ensure all materials with textures also reference loaded textures
-        obj.traverse((child) => {
-          if (child.isMesh) {
-            const mats = Array.isArray(child.material) ? child.material : [child.material];
-            for (const mat of mats) {
-              resolveMatTextures(mat);
-            }
-          }
-        });
 
         resolve(obj);
       } catch (e) {
@@ -261,26 +226,7 @@ function parseOBJ(file, materials) {
   });
 }
 
-function resolveMatTextures(mat) {
-  const mapTypes = ["map", "normalMap", "specularMap", "emissiveMap", "bumpMap", "alphaMap"];
-  for (const mt of mapTypes) {
-    const tex = mat[mt];
-    if (!tex) continue;
-    // If texture has no image data, try resolving from our loaded textures
-    if (!tex.image || (tex.image && tex.image.width === 0)) {
-      const src = tex.name || tex.sourceFile || (tex.userData && tex.userData.src) || "";
-      const match = findTextureMatch(src);
-      if (match && loadedTextures.has(match)) {
-        mat[mt] = loadedTextures.get(match).clone();
-        mat[mt].needsUpdate = true;
-      }
-    }
-  }
-}
-
 function autoApplyTextures(obj) {
-  // If there's exactly one texture, apply to all meshes
-  // If there are multiple, apply to meshes by matching name heuristic or first available
   const texArr = [...loadedTextures.entries()];
   if (texArr.length === 0) return;
 
@@ -289,7 +235,6 @@ function autoApplyTextures(obj) {
     const mats = Array.isArray(child.material) ? child.material : [child.material];
     for (const mat of mats) {
       if (!mat.map) {
-        // Try to match by mesh/material name, else use first texture
         let matched = null;
         for (const [name] of texArr) {
           const meshName = (child.name || "").toLowerCase();
@@ -301,8 +246,10 @@ function autoApplyTextures(obj) {
           }
         }
         const texName = matched || texArr[0][0];
-        mat.map = loadedTextures.get(texName).clone();
-        mat.map.needsUpdate = true;
+        const tex = loadedTextures.get(texName).clone();
+        tex.name = texName;
+        tex.needsUpdate = true;
+        mat.map = tex;
         mat.needsUpdate = true;
       }
     }
@@ -350,7 +297,7 @@ function loadTextureFromFile(file) {
   });
 }
 
-// ── Original material cache ────────────────────────────────────────
+// ── Original material cache (for texture toggles) ──────────────────
 function cacheOriginalMaterials(model) {
   originalMaterials.clear();
   model.traverse((child) => {
@@ -359,16 +306,18 @@ function cacheOriginalMaterials(model) {
     mats.forEach((mat, idx) => {
       const mapTypes = ["map", "normalMap", "specularMap", "emissiveMap", "bumpMap", "alphaMap"];
       for (const mt of mapTypes) {
-        if (mat[mt] && mat[mt].name) {
-          const key = `${child.uuid}_${idx}_${mt}`;
-          originalMaterials.set(key, {
-            mesh: child,
-            matIndex: idx,
-            mapType: mt,
-            textureName: mat[mt].name,
-            texture: mat[mt],
-          });
-        }
+        const tex = mat[mt];
+        if (!tex) continue;
+        const texName = tex.name || "";
+        if (!texName) continue;
+        const key = `${child.uuid}_${idx}_${mt}`;
+        originalMaterials.set(key, {
+          mesh: child,
+          matIndex: idx,
+          mapType: mt,
+          textureName: texName,
+          texture: tex,
+        });
       }
     });
   });
@@ -383,18 +332,10 @@ function buildTexturePanel() {
     return;
   }
 
-  const names = new Set([...textureFiles.keys(), ...loadedTextures.keys()]);
-  // Also collect texture names from the model materials
-  if (currentModel) {
-    currentModel.traverse((child) => {
-      if (!child.isMesh) return;
-      const mats = Array.isArray(child.material) ? child.material : [child.material];
-      for (const mat of mats) {
-        for (const mt of ["map", "normalMap", "specularMap", "emissiveMap", "bumpMap", "alphaMap"]) {
-          if (mat[mt] && mat[mt].name) names.add(mat[mt].name);
-        }
-      }
-    });
+  // Collect all texture names: from loaded files + from model materials
+  const names = new Set([...loadedTextures.keys()]);
+  for (const entry of originalMaterials.values()) {
+    if (entry.textureName) names.add(entry.textureName);
   }
 
   for (const name of names) {
@@ -405,10 +346,10 @@ function buildTexturePanel() {
 
     // Thumbnail
     const tex = loadedTextures.get(name);
-    if (tex && tex.image) {
+    if (tex && tex.image && tex.image.src) {
       const thumb = document.createElement("img");
       thumb.className = "tex-thumb";
-      thumb.src = tex.image.src || "";
+      thumb.src = tex.image.src;
       div.appendChild(thumb);
     }
 
@@ -420,8 +361,8 @@ function buildTexturePanel() {
     label.appendChild(span);
     div.appendChild(label);
 
-    // Toggle
-    const toggle = document.createElement("div");
+    // Toggle switch — use <label> so clicking the slider toggles the checkbox
+    const toggle = document.createElement("label");
     toggle.className = "toggle";
     const cb = document.createElement("input");
     cb.type = "checkbox";
