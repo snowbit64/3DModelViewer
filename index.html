@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Model Viewer</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="toolbar">
+    <div id="toolbar-left">
+      <label class="file-btn">
+        Load OBJ
+        <input type="file" id="obj-input" accept=".obj" />
+      </label>
+      <label class="file-btn">
+        Load MTL
+        <input type="file" id="mtl-input" accept=".mtl" />
+      </label>
+      <label class="file-btn">
+        Load Textures
+        <input type="file" id="tex-input" accept=".png,.jpg,.jpeg" multiple />
+      </label>
+      <button id="btn-load" disabled>Load Model</button>
+      <button id="btn-clear">Clear</button>
+    </div>
+    <div id="file-info"></div>
+  </div>
+
+  <div id="main-container">
+    <canvas id="viewer-canvas"></canvas>
+    <div id="texture-panel">
+      <h3>Textures</h3>
+      <div id="texture-list"><em>No textures loaded</em></div>
+    </div>
+  </div>
+
+  <div id="status-bar">Ready</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="js/viewer.js"></script>
+</body>
+</html>
